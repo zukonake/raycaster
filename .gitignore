@@ -1,0 +1,17 @@
+# Ignore generated folders
+build
+# Ignore generated files
+callgrind*
+vgcore*
+*~
+*.swp
+
+# Ignore binary files
+*.a
+*.so
+*.bin
+*.dll
+*.o
+*.exe
+*.out
+raycaster
