@@ -33,12 +33,10 @@ typedef uint32_t U32;
 typedef float    F32;
 typedef double   F64;
 
-struct Vert { vec2 pos; vec2 tx_pos; };
-
 constexpr U32   win_scale = 5;
 constexpr uvec2 win_size = {320, 180};
 constexpr U32   win_volume = win_size.x * win_size.y;
-constexpr uvec3 map_size = {512, 512, 256};
+constexpr uvec3 map_size = {128, 128, 128};
 constexpr U32   map_volume = map_size.x * map_size.y * map_size.z;
 
 constexpr F32 TAU = pi<F32>() * 2.f;
@@ -49,33 +47,26 @@ struct Voxel
     F32  a;
 };
 
-constexpr Voxel border_voxel = {{0.0f, 0.0f, 0.0f}, 1.0f};
+constexpr Voxel border_voxel = {{0.7f, 0.7f, 0.8f}, 1.0f};
 constexpr Voxel empty_voxel  = {{0.0f, 0.0f, 0.0f}, 0.01f};
-constexpr Voxel water_voxel  = {{0.2f, 0.5f, 0.8f}, 0.1f};
+constexpr Voxel fog_voxel    = {{0.7f, 0.7f, 0.8f}, 0.01f};
+constexpr Voxel water_voxel  = {{0.1f, 0.3f, 0.6f}, 0.05f};
 constexpr Voxel sand_voxel   = {{1.0f, 1.0f, 0.6f}, 1.0f};
 constexpr Voxel stone_voxel  = {{0.4f, 0.4f, 0.4f}, 1.0f};
 constexpr Voxel snow_voxel   = {{0.9f, 0.9f, 1.0f}, 1.0f};
 constexpr Voxel grass_voxel  = {{0.3f, 0.8f, 0.2f}, 1.0f};
 constexpr Voxel dirt_voxel   = {{0.6f, 0.3f, 0.1f}, 1.0f};
+constexpr Voxel player_voxel = {{1.0f, 0.0f, 1.0f}, 1.0f};
 
-Voxel map[map_volume];
-U8    cast_plane[win_volume * 3];
+Voxel       map[map_volume];
+tvec3<U8>   cast_plane[win_volume];
 GLFWwindow *win;
 
-struct OctNode
-{
-    union
-    {
-        OctNode *nodes[8];
-        Voxel    leaf;
-    };
-    bool is_leaf;
-};
-
-F32  player_yaw = TAU / 3.f;
-F32  player_pitch = 0;
-vec3 player_vel = {0, 0, 0};
-vec3 player_pos = {map_size.x / 2, map_size.y / 2, 250};
+F32   player_yaw = TAU / 3.f;
+F32   player_pitch = 0;
+ivec3 player_cursor = {-1, -1, -1};
+vec3  player_vel = {0, 0, 0};
+vec3  player_pos = {map_size.x / 2, map_size.y / 2, 70};
 
 template<typename T>
 bool outside_bounds(tvec3<T> const &pos)
@@ -88,13 +79,13 @@ bool outside_bounds(tvec3<T> const &pos)
 
 U32 get_map_idx(uvec3 const &pos)
 {
-    return pos.x + pos.y * map_size.x + pos.z * map_size.x * map_size.y;
+    return pos.x | (pos.y << 7) | (pos.z << 14);
 }
 
 Voxel const &get_voxel(ivec3 const &pos)
 {
     if(outside_bounds(pos)) return border_voxel;
-    else return map[get_map_idx((uvec3)pos)];
+    return map[get_map_idx((uvec3)pos)];
 }
 
 void init_gl()
@@ -110,6 +101,7 @@ void init_gl()
                            win_size.y * win_scale, "raycaster", NULL, NULL);
     glfwMakeContextCurrent(win);
     glfwSetInputMode(win, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+    glfwSetInputMode(win, GLFW_STICKY_MOUSE_BUTTONS, 1);
     glfwSwapInterval(0);
 
     if(gladLoadGLLoader((GLADloadproc)glfwGetProcAddress) == 0)
@@ -120,10 +112,24 @@ void init_gl()
     glViewport(0, 0, win_size.x * win_scale, win_size.y * win_scale);
 }
 
+F32 randf()
+{
+    return (F32)(std::rand() % 0x10000) / 0x10000;
+}
+
 F32 randf(F32 dist)
 {
-    return (((F32)(std::rand() % 0x10000) / 0x10000) / dist) +
-           ((1.f - (1.f / dist)) / 2.f);
+    return (randf() / dist) + ((1.f - (1.f / dist)) / 2.f);
+}
+
+F32 randf(F32 min, F32 max)
+{
+    return (randf() * (max - min)) + min;
+}
+
+F32 blur(F32 val, F32 dist)
+{
+    return std::clamp(val += (randf() / dist) - (0.5f / dist), 0.f, 1.f);
 }
 
 void init_map()
@@ -150,14 +156,30 @@ void init_map()
                 else if(rel_h > 0.4)  voxel = dirt_voxel;
                 else if(rel_h > 0.33) voxel = grass_voxel;
                 else                  voxel = sand_voxel;
-                voxel.col *= randf(8.f);
+                voxel.col.r = blur(voxel.col.r, 16.f);
+                voxel.col.g = blur(voxel.col.g, 16.f);
+                voxel.col.b = blur(voxel.col.b, 16.f);
+                voxel.col   *= randf(0.75f, 1.f);
                 map[get_map_idx({x, y, z})] = voxel;
             }
             for(U32 z = h; z < map_size.z; ++z)
             {
                 F32 rel_z = ((F32)z / (F32)map_size.z);
-                if(rel_z < 0.3) map[get_map_idx({x, y, z})] = water_voxel;
-                else            map[get_map_idx({x, y, z})] = empty_voxel;
+                F32 f = simplex(vec3(x, y, z) * 0.07f);
+                Voxel voxel;
+                if(rel_z < 0.3f) voxel = water_voxel;
+                else
+                {
+                    if(f > 1.f - rel_z)
+                    {
+                        voxel = fog_voxel;
+                        voxel.col.r *= randf(0.5, 1.f);
+                        voxel.col.g *= randf(0.5, 1.f);
+                        voxel.col.b *= randf(0.5, 1.f);
+                    }
+                    else                voxel = empty_voxel;
+                }
+                map[get_map_idx({x, y, z})] = voxel;
             }
         }
     }
@@ -203,30 +225,46 @@ void check_gl_error()
     }
 }
 
-vec4 cast_ray(vec3 const &from, vec3 const &to)
+struct RayHit
+{
+    vec4 col;
+    vec3 pos;
+    vec3 vox_pos;
+    vec3 norm;
+};
+
+U32 i = 0;
+
+bool cast_ray(vec3 const &from, vec3 const &to, RayHit &hit)
 {
     ivec3 iter = (ivec3)from;
     vec3 ray = to - from;
     ivec3 r_sign = (ivec3)sign(ray);
     vec3 t_delta;
     vec3 t_max;
+    vec3 dist;
+
     t_delta.x = (r_sign.x != 0) ? (F32)r_sign.x / ray.x : FLT_MAX;
     t_delta.y = (r_sign.y != 0) ? (F32)r_sign.y / ray.y : FLT_MAX;
     t_delta.z = (r_sign.z != 0) ? (F32)r_sign.z / ray.z : FLT_MAX;
-    t_max.x = r_sign.x > 0 ? t_delta.x * (1.f - from.x + std::floor(from.x)) :
-                             t_delta.x * (from.x - std::floor(from.x));
-    t_max.y = r_sign.y > 0 ? t_delta.y * (1.f - from.y + std::floor(from.y)) :
-                             t_delta.y * (from.y - std::floor(from.y));
-    t_max.z = r_sign.z > 0 ? t_delta.z * (1.f - from.z + std::floor(from.z)) :
-                             t_delta.z * (from.z - std::floor(from.z));
+    dist.x = r_sign.x > 0 ? (1.f - from.x + iter.x) :
+                            (from.x - iter.x);
+    dist.y = r_sign.y > 0 ? (1.f - from.y + iter.y) :
+                            (from.y - iter.y);
+    dist.z = r_sign.z > 0 ? (1.f - from.z + iter.z) :
+                            (from.z - iter.z);
+    t_max.x = r_sign.x != 0 ? t_delta.x * dist.x : FLT_MAX;
+    t_max.y = r_sign.y != 0 ? t_delta.y * dist.y : FLT_MAX;
+    t_max.z = r_sign.z != 0 ? t_delta.z * dist.z : FLT_MAX;
+
+    F32 t = 0.f;
+    hit.norm = {0, 0, 0};
 
     vec3 col = {0, 0, 0};
+    enum { X, Y, Z } normal;
     F32  alpha = 0;
-    Voxel const *vox = &get_voxel(iter);
-    col   += vox->col * std::min(1.f - alpha, vox->a);
-    alpha += vox->a;
-    if(alpha >= 1.f) return vec4(col / alpha, 1.f);
-    while(true)
+    Voxel const *vox;
+    while(t_max.x <= 1.f || t_max.y <= 1.f || t_max.z <= 1.f)
     {
         if(t_max.x < t_max.y)
         {
@@ -234,11 +272,15 @@ vec4 cast_ray(vec3 const &from, vec3 const &to)
             {
                 iter.x  += r_sign.x;
                 t_max.x += t_delta.x;
+                t = t_max.x;
+                normal = X;
             }
             else
             {
                 iter.z  += r_sign.z;
                 t_max.z += t_delta.z;
+                t = t_max.z;
+                normal = Z;
             }
         }
         else
@@ -247,27 +289,40 @@ vec4 cast_ray(vec3 const &from, vec3 const &to)
             {
                 iter.y  += r_sign.y;
                 t_max.y += t_delta.y;
+                t = t_max.y;
+                normal = Y;
             }
             else
             {
                 iter.z  += r_sign.z;
                 t_max.z += t_delta.z;
+                t = t_max.z;
+                normal = Z;
             }
         }
-        vox = &get_voxel(iter);
+        vox    = &get_voxel(iter);
         col   += vox->col * std::min(1.f - alpha, vox->a);
-        alpha += vox->a;
-        if(alpha >= 1.f) return vec4(col / alpha, 1.f);
-        if(t_max.x > 1.f && t_max.y > 1.f && t_max.z > 1.f) break;
+        alpha += std::min(1.f - alpha, vox->a);
+        if(alpha >= 1.f)
+        {
+                 if(normal == X) hit.norm = {-r_sign.x, 0, 0};
+            else if(normal == Y) hit.norm = {0, -r_sign.y, 0};
+            else if(normal == Z) hit.norm = {0, 0, -r_sign.z};
+            i++;
+            hit.col = vec4(col / alpha, 1.f);
+            hit.pos = from + t * ray;
+            hit.vox_pos = iter;
+            return true;
+        }
     }
-    return {empty_voxel.col, empty_voxel.a};
+    return false;
 }
 
 void cast()
 {
     F32 z_near = 0.01f;
-    F32 z_far  = -256.f;
-    vec3 origin = player_pos + vec3(0, 0, 1);
+    F32 z_far  = -512.f;
+    vec3 origin = player_pos + vec3(0, 0, 2);
     mat4 rot(1.f);
     rot = translate(rot, origin);
     rot *= eulerAngleZY(player_yaw, player_pitch);
@@ -281,22 +336,29 @@ void cast()
                         - near_pixel;
     vec3 near_delta_y = plane(z_near, (win_half + vec2(0, 1)) / (vec2)win_size)
                         - near_pixel;
-    vec3 far_pixel = plane(z_far, win_half * 2.f);
-    vec3 far_delta_x = plane(z_far, (win_half + vec2(1, 0)) * 2.f) - far_pixel;
-    vec3 far_delta_y = plane(z_far, (win_half + vec2(0, 1)) * 2.f) - far_pixel;
+    vec3 far_pixel = plane(z_far, win_half * 16.f);
+    vec3 far_delta_x = plane(z_far, (win_half + vec2(1, 0)) * 16.f) - far_pixel;
+    vec3 far_delta_y = plane(z_far, (win_half + vec2(0, 1)) * 16.f) - far_pixel;
+
+    RayHit hit;
     for(U32 i = 0; i < win_volume; ++i)
     {
         vec2 plane_pos = {(i % win_size.x) + 0.5f, (i / win_size.x) + 0.5f};
         vec3 near = near_pixel +
-                    near_delta_x * plane_pos.x +
-                    near_delta_y * plane_pos.y;
+                    near_delta_x * (plane_pos.x) +
+                    near_delta_y * (plane_pos.y);
         vec3 far = far_pixel +
-                   far_delta_x * plane_pos.x +
-                   far_delta_y * plane_pos.y;
-        vec4 col = cast_ray(near, far);
-        cast_plane[i * 3 + 0] = col.r * 255.f * col.a;
-        cast_plane[i * 3 + 1] = col.g * 255.f * col.a;
-        cast_plane[i * 3 + 2] = col.b * 255.f * col.a;
+                   far_delta_x * (plane_pos.x) +
+                   far_delta_y * (plane_pos.y);
+        if(cast_ray(near, far, hit))
+        {
+            if((ivec3)(hit.vox_pos + hit.norm) == player_cursor)
+            {
+                hit.col = {1.f, 1.f, 0.f, 1.f};
+            }
+            cast_plane[i] = vec3(hit.col) * hit.col.a * 255.f;
+        }
+        else cast_plane[i] = empty_voxel.col * 255.f;
     }
 }
 
@@ -311,6 +373,9 @@ int main()
 
     dvec2 mouse_pos;
     dvec2 last_mouse_pos(0, 0);
+    U32 place_delay = 0;
+    U32 dest_delay = 0;
+    U32 jump_delay = 0;
     while(!glfwWindowShouldClose(win))
     {
         clock.start();
@@ -329,40 +394,84 @@ int main()
 
         last_mouse_pos = mouse_pos;
 
-        vec3 dir = {0, 0, 0};
+        vec2 dir = {0, 0};
         if(glfwGetKey(win, GLFW_KEY_W)) dir.x = -1.f;
         if(glfwGetKey(win, GLFW_KEY_S)) dir.x =  1.f;
         if(glfwGetKey(win, GLFW_KEY_A)) dir.y = -1.f;
         if(glfwGetKey(win, GLFW_KEY_D)) dir.y =  1.f;
         if(glfwGetKey(win, GLFW_KEY_SPACE) &&
-           get_voxel((ivec3)(player_pos - vec3(0, 0, 1))).a >= 1.f)
+           get_voxel((ivec3)(player_pos - vec3(0, 0, 0.3))).a >= 1.f)
         {
-            dir.z = 10.f;
+            if(jump_delay == 0)
+            {
+                jump_delay = 10;
+                player_vel.z = 1.0f;
+            }
         }
-        if(dir != vec3(0, 0, 0))
+        if(length(dir) > 0)
         {
             mat4 rot = eulerAngleZ(player_yaw);
-            dir = vec3(rot * vec4(dir, 1.f));
-            player_vel += dir * 0.3f;
+            dir = vec2(rot * vec4(normalize(dir), 0.f, 1.f));
+            player_vel.x = dir.x * 0.2f;
+            player_vel.y = dir.y * 0.2f;
         }
-        player_vel += vec3(0, 0, -0.3f);
+        player_vel += vec3(0, 0, -0.1f);
 
-        if(cast_ray(player_pos, player_pos + vec3(player_vel.x, 0, 0)).a < 1.f)
+        RayHit hit;
+        if(!cast_ray(player_pos, player_pos + vec3(player_vel.x, 0, 0), hit))
         {
             player_pos.x += player_vel.x;
         }
         else player_vel.x = 0;
-        if(cast_ray(player_pos, player_pos + vec3(0, player_vel.y, 0)).a < 1.f)
+        if(!cast_ray(player_pos, player_pos + vec3(0, player_vel.y, 0), hit))
         {
             player_pos.y += player_vel.y;
         }
         else player_vel.y = 0;
-        if(cast_ray(player_pos, player_pos + vec3(0, 0, player_vel.z)).a < 1.f)
+        if(!cast_ray(player_pos, player_pos + vec3(0, 0, player_vel.z), hit))
         {
             player_pos.z += player_vel.z;
         }
         else player_vel.z = 0;
-        player_vel *= 0.5f;
+        player_vel *= 0.8f;
+
+        F32 range = 10.f;
+        mat4 rot = eulerAngleZY(player_yaw, player_pitch);
+        vec3 dest = vec3(rot * vec4(-1.f, 0.f, 0.f, 1.f));
+        if(cast_ray(player_pos + vec3(0, 0, 2.5),
+                    player_pos + vec3(0, 0, 2.5) + dest * range, hit))
+        {
+            I32 state = glfwGetMouseButton(win, GLFW_MOUSE_BUTTON_LEFT);
+            if(state == GLFW_PRESS && place_delay == 0)
+            {
+                place_delay = 10;
+                if(!outside_bounds((ivec3)(hit.vox_pos + hit.norm)))
+                {
+                    Voxel vox = player_voxel;
+                    vox.col.r = blur(vox.col.r, 4.f);
+                    vox.col.g = blur(vox.col.g, 4.f);
+                    vox.col.b = blur(vox.col.b, 4.f);
+                    map[get_map_idx((uvec3)(hit.vox_pos + hit.norm))] = vox;
+                }
+            }
+            state = glfwGetMouseButton(win, GLFW_MOUSE_BUTTON_RIGHT);
+            if(state == GLFW_PRESS && dest_delay == 0)
+            {
+                dest_delay = 3;
+                if(!outside_bounds((ivec3)hit.vox_pos))
+                {
+                    map[get_map_idx((uvec3)hit.vox_pos)] = empty_voxel;
+                }
+            }
+            else
+            {
+                player_cursor = (ivec3)(hit.vox_pos + hit.norm);
+            }
+        }
+        else player_cursor = {-1, -1, -1};
+        if(place_delay > 0) place_delay--;
+        if(dest_delay > 0) dest_delay--;
+        if(jump_delay > 0) jump_delay--;
 
         glfwSwapBuffers(win);
         glfwPollEvents();
