@@ -30,15 +30,18 @@ typedef int8_t   I8;
 typedef int16_t  I16;
 typedef int32_t  I32;
 typedef int64_t  I64;
+
 typedef uint8_t  U8;
 typedef uint16_t U16;
 typedef uint32_t U32;
 typedef uint64_t U64;
+
 typedef float    F32;
 typedef double   F64;
 
-constexpr U32   win_scale = 10;
-constexpr uvec2 win_size = {160, 90};
+constexpr F32   fps        = 30.f;
+constexpr U32   win_scale  = 10;
+constexpr uvec2 win_size   = {160, 90};
 constexpr U32   win_volume = win_size.x * win_size.y;
 
 constexpr F32 TAU = pi<F32>() * 2.f;
@@ -47,12 +50,13 @@ struct Voxel
 {
     vec3 col;
     F32  a;
+    vec3 variance = {0, 0, 0};
 };
 
 constexpr Voxel border_voxel = {{0.7f, 0.7f, 0.8f}, 1.0f};
-constexpr Voxel empty_voxel  = {{0.0f, 0.0f, 0.0f}, 0.01f};
-constexpr Voxel fog_voxel    = {{0.7f, 0.7f, 0.8f}, 0.01f};
-constexpr Voxel water_voxel  = {{0.1f, 0.3f, 0.6f}, 0.05f};
+constexpr Voxel empty_voxel  = {{0.3f, 0.4f, 0.7f}, 0.004f};
+constexpr Voxel fog_voxel    = {{0.8f, 0.8f, 0.9f}, 0.02f};
+constexpr Voxel water_voxel  = {{0.1f, 0.2f, 0.5f}, 0.05f};
 constexpr Voxel sand_voxel   = {{1.0f, 1.0f, 0.6f}, 1.0f};
 constexpr Voxel stone_voxel  = {{0.4f, 0.4f, 0.4f}, 1.0f};
 constexpr Voxel snow_voxel   = {{0.9f, 0.9f, 1.0f}, 1.0f};
@@ -63,11 +67,18 @@ constexpr Voxel player_voxel = {{1.0f, 0.0f, 1.0f}, 1.0f};
 tvec3<U8>   cast_plane[win_volume];
 GLFWwindow *win;
 
-F32   player_yaw = TAU / 3.f;
-F32   player_pitch = 0;
-ivec3 player_cursor = {-1, -1, -1};
-vec3  player_vel = {0, 0, 0};
-vec3  player_pos = {0, 0, 60};
+struct Player
+{
+    F32   yaw = TAU / 3.f;
+    F32   pitch = 0;
+    ivec3 cursor = {-1, -1, -1};
+    vec3  vel = {0, 0, 0};
+    vec3  pos = {0, 0, 60};
+    U32   place_delay = 0;
+    U32   dest_delay = 0;
+    U32   jump_delay = 0;
+    dvec2 last_mouse_pos = (dvec2)(win_size * win_scale) / 2.0;
+} player;
 
 constexpr U64   chk_size_exp  = 4;
 constexpr uvec3 chk_size      = {1 << chk_size_exp,
@@ -96,6 +107,7 @@ struct Chunk
 
 U8 chunk_io_buff[chk_vol * 5];
 
+constexpr F32   max_map_h = 128;
 std::unordered_map<U64, Chunk, Identity> map;
 std::unordered_map<U64, F32[chk_vol], Identity> height_map;
 
@@ -147,6 +159,34 @@ std::string get_chunk_path(U64 idx)
     return std::string("chunks/" + std::to_string(idx));
 }
 
+void encode_chunk(U8 *buff, Chunk const &chunk)
+{
+    U16 alpha;
+    for(U32 i = 0; i < chk_vol; ++i)
+    {
+        buff[i * 5 + 0] = (U8)(chunk.voxels[i].col.r * 255.f);
+        buff[i * 5 + 1] = (U8)(chunk.voxels[i].col.g * 255.f);
+        buff[i * 5 + 2] = (U8)(chunk.voxels[i].col.b * 255.f);
+        alpha = (U16)(std::round(chunk.voxels[i].a * 65535.f));
+        buff[i * 5 + 3] = ((U8 *)&alpha)[0];
+        buff[i * 5 + 4] = ((U8 *)&alpha)[1];
+    }
+}
+
+void decode_chunk(U8 const *buff, Chunk &chunk)
+{
+    U16 alpha;
+    for(U32 i = 0; i < chk_vol; ++i)
+    {
+        chunk.voxels[i].col.r = (F32)buff[i * 5 + 0] / 255.f;
+        chunk.voxels[i].col.g = (F32)buff[i * 5 + 1] / 255.f;
+        chunk.voxels[i].col.b = (F32)buff[i * 5 + 2] / 255.f;
+        ((U8 *)&alpha)[0] = buff[i * 5 + 3];
+        ((U8 *)&alpha)[1] = buff[i * 5 + 4];
+        chunk.voxels[i].a = (F32)alpha / 65535.f;
+    }
+}
+
 void save_chunk(U64 idx, Chunk const &chunk)
 {
     std::ofstream f;
@@ -156,15 +196,7 @@ void save_chunk(U64 idx, Chunk const &chunk)
         throw std::runtime_error("couldn't save chunk "
                                  "you need to create the folder \"chunks\"");
     }
-    for(U32 i = 0; i < chk_vol; ++i)
-    {
-        chunk_io_buff[i * 5 + 0] = (U8)(chunk.voxels[i].col.r * 255.f);
-        chunk_io_buff[i * 5 + 1] = (U8)(chunk.voxels[i].col.g * 255.f);
-        chunk_io_buff[i * 5 + 2] = (U8)(chunk.voxels[i].col.b * 255.f);
-        U16 alpha = (U16)(chunk.voxels[i].a * 65535.f);
-        chunk_io_buff[i * 5 + 3] = ((U8 *)&alpha)[0];
-        chunk_io_buff[i * 5 + 4] = ((U8 *)&alpha)[1];
-    }
+    encode_chunk(chunk_io_buff, chunk);
     f.write((char *)chunk_io_buff, 5 * chk_vol);
     f.close();
 }
@@ -176,16 +208,7 @@ bool load_chunk(U64 idx, Chunk &chunk)
     if(f.good())
     {
         f.read((char *)chunk_io_buff, 5 * chk_vol);
-        for(U32 i = 0; i < chk_vol; ++i)
-        {
-            chunk.voxels[i].col.r = (F32)chunk_io_buff[i * 5 + 0] / 255.f;
-            chunk.voxels[i].col.g = (F32)chunk_io_buff[i * 5 + 1] / 255.f;
-            chunk.voxels[i].col.b = (F32)chunk_io_buff[i * 5 + 2] / 255.f;
-            U16 alpha;
-            ((U8 *)&alpha)[0] = chunk_io_buff[i * 5 + 3];
-            ((U8 *)&alpha)[1] = chunk_io_buff[i * 5 + 4];
-            chunk.voxels[i].a = (F32)alpha / 65535.f;
-        }
+        decode_chunk(chunk_io_buff, chunk);
         f.close();
         return true;
     }
@@ -214,35 +237,43 @@ void save_all()
     }
 }
 
+void generate_height_chunk(ivec3 const &chk_h_pos)
+{
+    constexpr U32 octaves = 8;
+    constexpr F32 base_scale = 0.0025f;
+    constexpr F32 height_exp = 2.f;
+    U64 packed_chk_h_pos = pack_vec(chk_h_pos);
+    height_map[packed_chk_h_pos];
+    for(U32 y = 0; y < chk_size.y; ++y)
+    {
+        for(U32 x = 0; x < chk_size.x; ++x)
+        {
+            vec2 map_h_pos = vec2(get_map_pos(chk_h_pos) + ivec3(x, y, 0));
+            F32 scale  = base_scale;
+            F32 weight = 1.f;
+            F32 avg    = 0.f;
+            for(U32 o = 0; o < octaves; ++o)
+            {
+                avg    += simplex(map_h_pos * scale) * weight;
+                scale  *= 2.f;
+                weight /= 2.f;
+            }
+            F32 h = std::pow(((avg / (2.f - (weight * 2.f)))
+                             + 1.f) / 2.f, height_exp) * max_map_h;
+            height_map[packed_chk_h_pos][get_chk_idx({x, y, 0})] = h;
+        }
+    }
+}
+
 void generate_chunk(Chunk &chunk, ivec3 const &chk_pos)
 {
-    constexpr F32 map_h = 128;
     U64 packed_chk_idx   = pack_vec(chk_pos);
     if(load_chunk(packed_chk_idx, chunk)) return;
     ivec3 chk_h_pos = {chk_pos.x, chk_pos.y, 0};
     U64 packed_chk_h_pos = pack_vec(chk_h_pos);
     if(height_map.count(packed_chk_h_pos) == 0)
     {
-        height_map[packed_chk_h_pos];
-        for(U32 y = 0; y < chk_size.y; ++y)
-        {
-            for(U32 x = 0; x < chk_size.x; ++x)
-            {
-                vec3 map_pos = (vec3)(get_map_pos(chk_pos) + ivec3(x, y, 0));
-                vec2 h_pos = vec2(map_pos);
-                F32 o1 = simplex(h_pos * 0.0025f) * 1.f;
-                F32 o2 = simplex(h_pos * 0.005f) * 0.5f;
-                F32 o3 = simplex(h_pos * 0.01f) * 0.25f;
-                F32 o4 = simplex(h_pos * 0.02f) * 0.125f;
-                F32 o5 = simplex(h_pos * 0.04f) * 0.0625f;
-                F32 o6 = simplex(h_pos * 0.08f) * 0.03125f;
-                F32 o7 = simplex(h_pos * 0.16f) * 0.01575f;
-                F32 o8 = simplex(h_pos * 0.32f) * 0.007875f;
-                F32 h = std::pow((((o1 + o2 + o3 + o4 + o5 + o6 + o7 + o8) / 1.993235f)
-                         + 1.f) / 2.f, 2.f) * map_h;
-                height_map[packed_chk_h_pos][get_chk_idx({x, y, 0})] = h;
-            }
-        }
+        generate_height_chunk(chk_h_pos);
     }
     for(U32 z = 0; z < chk_size.z; ++z)
     {
@@ -257,7 +288,7 @@ void generate_chunk(Chunk &chunk, ivec3 const &chk_pos)
                 Voxel voxel;
                 if(map_pos.z <= h)
                 {
-                    F32 rel_h = h / map_h;
+                    F32 rel_h = h / max_map_h;
                          if(rel_h > 0.8)  voxel = snow_voxel;
                     else if(rel_h > 0.5)  voxel = stone_voxel;
                     else if(rel_h > 0.4)  voxel = dirt_voxel;
@@ -271,7 +302,7 @@ void generate_chunk(Chunk &chunk, ivec3 const &chk_pos)
                 }
                 else
                 {
-                    F32 rel_z = (F32)map_pos.z / map_h;
+                    F32 rel_z = (F32)map_pos.z / max_map_h;
                     if(rel_z < 0.3f) voxel = water_voxel;
                     else
                     {
@@ -300,7 +331,7 @@ Chunk &get_chunk(ivec3 const &chk_pos)
     U64 idx = pack_vec(chk_pos);
     if(map.count(idx) == 0)
     {
-        map[idx] = { };
+        map[idx];
         generate_chunk(map[idx], chk_pos);
     }
     map[idx].unload_timer = chunk_unload_time;
@@ -334,19 +365,16 @@ void init_gl()
     }
 
     glViewport(0, 0, win_size.x * win_scale, win_size.y * win_scale);
-}
 
-void init_fb()
-{
-    GLuint id;
-    glGenTextures(1, &id);
-    glBindTexture(GL_TEXTURE_2D, id);
+    GLuint tex_id;
+    glGenTextures(1, &tex_id);
+    glBindTexture(GL_TEXTURE_2D, tex_id);
 
     GLuint fb_id;
     glGenFramebuffers(1, &fb_id);
     glBindFramebuffer(GL_READ_FRAMEBUFFER, fb_id);
     glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                           GL_TEXTURE_2D, id, 0);
+                           GL_TEXTURE_2D, tex_id, 0);
 }
 
 void render_screen()
@@ -412,7 +440,10 @@ bool cast_ray(vec3 const &from, vec3 const &to, RayHit &hit)
     vec3 col = {0, 0, 0};
     enum { X, Y, Z } normal;
     F32  alpha = 0;
+    ivec3 cached_chk_pos = get_chk_pos(iter);
+    ivec3 current_chk_pos;
     Voxel const *vox;
+    Chunk const *chk = &get_chunk(cached_chk_pos);
     while(t_max.x <= 1.f || t_max.y <= 1.f || t_max.z <= 1.f)
     {
         if(t_max.x < t_max.y)
@@ -449,10 +480,16 @@ bool cast_ray(vec3 const &from, vec3 const &to, RayHit &hit)
                 normal = Z;
             }
         }
-        vox    = &get_vox(iter);
+        current_chk_pos = get_chk_pos(iter);
+        if(cached_chk_pos != current_chk_pos)
+        {
+            chk = &get_chunk(current_chk_pos);
+            cached_chk_pos = current_chk_pos;
+        }
+        vox    = &chk->voxels[get_chk_idx(iter)];
         col   += vox->col * std::min(1.f - alpha, vox->a);
         alpha += std::min(1.f - alpha, vox->a);
-        if(alpha >= 1.f)
+        if(alpha >= 1.0f)
         {
                  if(normal == X) hit.norm = {-r_sign.x, 0, 0};
             else if(normal == Y) hit.norm = {0, -r_sign.y, 0};
@@ -470,10 +507,10 @@ void cast()
 {
     F32 z_near = 0.01f;
     F32 z_far  = -512.f;
-    vec3 origin = player_pos + vec3(0, 0, 2);
+    vec3 origin = player.pos + vec3(0, 0, 2);
     mat4 rot(1.f);
     rot = translate(rot, origin);
-    rot *= eulerAngleZY(player_yaw, player_pitch);
+    rot *= eulerAngleZY(player.yaw, player.pitch);
     auto plane = [&] (F32 x, vec2 const &pos) -> vec3
     {
         return vec3(rot * vec4(x, pos, 1.f));
@@ -500,7 +537,7 @@ void cast()
                    far_delta_y * (plane_pos.y);
         if(cast_ray(near, far, hit))
         {
-            if((ivec3)(hit.vox_pos + hit.norm) == player_cursor)
+            if((ivec3)(hit.vox_pos + hit.norm) == player.cursor)
             {
                 hit.col = {1.f, 1.f, 0.f, 1.f};
             }
@@ -510,20 +547,104 @@ void cast()
     }
 }
 
+void handle_input()
+{
+    RayHit hit;
+    dvec2 mouse_pos;
+
+    glfwGetCursorPos(win, &mouse_pos.x, &mouse_pos.y);
+    player.yaw   += (F32)(player.last_mouse_pos.x - mouse_pos.x) * 0.005f;
+    player.pitch += (F32)(player.last_mouse_pos.y - mouse_pos.y) * 0.005f;
+    player.pitch  = std::clamp(player.pitch, -(TAU / 4.f) + .001f,
+                                              (TAU / 4.f) - .001f);
+
+    player.last_mouse_pos = mouse_pos;
+
+    vec3 dir = {0, 0, 0};
+    if(glfwGetKey(win, GLFW_KEY_W)) dir.x = -1.f;
+    if(glfwGetKey(win, GLFW_KEY_S)) dir.x =  1.f;
+    if(glfwGetKey(win, GLFW_KEY_A)) dir.y = -1.f;
+    if(glfwGetKey(win, GLFW_KEY_D)) dir.y =  1.f;
+    if(glfwGetKey(win, GLFW_KEY_SPACE) &&
+       get_vox((ivec3)floor(player.pos - vec3(0, 0, 0.3))).a >= 1.f)
+    {
+        if(player.jump_delay == 0)
+        {
+            player.jump_delay = 10;
+            player.vel.z = 1.0f;
+        }
+    }
+    if(length(dir) > 0)
+    {
+        mat4 rot = eulerAngleZY(player.yaw, player.pitch);
+        dir = vec3(rot * vec4(normalize(dir), 1.f));
+        player.vel = dir * 0.8f;
+    }
+
+    F32 range = 10.f;
+    mat4 rot = eulerAngleZY(player.yaw, player.pitch);
+    vec3 dest = vec3(rot * vec4(-1.f, 0.f, 0.f, 1.f));
+    if(cast_ray(player.pos + vec3(0, 0, 1.5),
+                player.pos + vec3(0, 0, 1.5) + dest * range, hit))
+    {
+        I32 state = glfwGetMouseButton(win, GLFW_MOUSE_BUTTON_LEFT);
+        if(state == GLFW_PRESS && player.place_delay == 0)
+        {
+            player.place_delay = 10;
+            Voxel vox = player_voxel;
+            vox.col.r = blur(vox.col.r, 4.f);
+            vox.col.g = blur(vox.col.g, 4.f);
+            vox.col.b = blur(vox.col.b, 4.f);
+            get_vox((ivec3)(hit.vox_pos + hit.norm)) = vox;
+        }
+        state = glfwGetMouseButton(win, GLFW_MOUSE_BUTTON_RIGHT);
+        if(state == GLFW_PRESS && player.dest_delay == 0)
+        {
+            player.dest_delay = 3;
+            get_vox((ivec3)hit.vox_pos) = empty_voxel;
+        }
+        else
+        {
+            player.cursor = (ivec3)(hit.vox_pos + hit.norm);
+        }
+    }
+    else player.cursor = {-1, -1, -1};
+    if(player.place_delay > 0) player.place_delay--;
+    if(player.dest_delay  > 0) player.dest_delay--;
+    if(player.jump_delay  > 0) player.jump_delay--;
+}
+
+void handle_player_physics()
+{
+    RayHit hit;
+    //player.vel += vec3(0, 0, -0.1f);
+
+    if(!cast_ray(player.pos, player.pos + vec3(player.vel.x, 0, 0), hit))
+    {
+        player.pos.x += player.vel.x;
+    }
+    else player.vel.x = 0;
+    if(!cast_ray(player.pos, player.pos + vec3(0, player.vel.y, 0), hit))
+    {
+        player.pos.y += player.vel.y;
+    }
+    else player.vel.y = 0;
+    if(!cast_ray(player.pos, player.pos + vec3(0, 0, player.vel.z), hit))
+    {
+        player.pos.z += player.vel.z;
+    }
+    else player.vel.z = 0;
+    player.vel *= 0.8f;
+
+}
+
 int main()
 {
     std::srand(std::time(NULL));
     init_gl();
-    init_fb();
 
-    util::TickClock clock(util::TickClock::Duration(1.f) / 30.f);
+    util::TickClock clock(util::TickClock::Duration(1.f) / fps);
 
-    dvec2 mouse_pos;
-    dvec2 last_mouse_pos(0, 0);
-    U32 place_delay = 0;
-    U32 dest_delay = 0;
-    U32 jump_delay = 0;
-    RayHit hit;
     while(!glfwWindowShouldClose(win))
     {
         clock.start();
@@ -534,84 +655,8 @@ int main()
         render_screen();
         check_gl_error();
 
-        glfwGetCursorPos(win, &mouse_pos.x, &mouse_pos.y);
-        player_yaw   += (F32)(last_mouse_pos.x - mouse_pos.x) * 0.005f;
-        player_pitch += (F32)(last_mouse_pos.y - mouse_pos.y) * 0.005f;
-        player_pitch  = std::clamp(player_pitch, -(TAU / 4.f) + .001f,
-                                                  (TAU / 4.f) - .001f);
-
-        last_mouse_pos = mouse_pos;
-
-        vec3 dir = {0, 0, 0};
-        if(glfwGetKey(win, GLFW_KEY_W)) dir.x = -1.f;
-        if(glfwGetKey(win, GLFW_KEY_S)) dir.x =  1.f;
-        if(glfwGetKey(win, GLFW_KEY_A)) dir.y = -1.f;
-        if(glfwGetKey(win, GLFW_KEY_D)) dir.y =  1.f;
-        if(glfwGetKey(win, GLFW_KEY_SPACE) &&
-           get_vox((ivec3)floor(player_pos - vec3(0, 0, 0.3))).a >= 1.f)
-        {
-            if(jump_delay == 0)
-            {
-                jump_delay = 10;
-                player_vel.z = 1.0f;
-            }
-        }
-        if(length(dir) > 0)
-        {
-            mat4 rot = eulerAngleZY(player_yaw, player_pitch);
-            dir = vec3(rot * vec4(normalize(dir), 1.f));
-            player_vel = dir * 0.8f;
-        }
-        //player_vel += vec3(0, 0, -0.1f);
-
-        if(!cast_ray(player_pos, player_pos + vec3(player_vel.x, 0, 0), hit))
-        {
-            player_pos.x += player_vel.x;
-        }
-        else player_vel.x = 0;
-        if(!cast_ray(player_pos, player_pos + vec3(0, player_vel.y, 0), hit))
-        {
-            player_pos.y += player_vel.y;
-        }
-        else player_vel.y = 0;
-        if(!cast_ray(player_pos, player_pos + vec3(0, 0, player_vel.z), hit))
-        {
-            player_pos.z += player_vel.z;
-        }
-        else player_vel.z = 0;
-        player_vel *= 0.8f;
-
-        F32 range = 10.f;
-        mat4 rot = eulerAngleZY(player_yaw, player_pitch);
-        vec3 dest = vec3(rot * vec4(-1.f, 0.f, 0.f, 1.f));
-        if(cast_ray(player_pos + vec3(0, 0, 1.5),
-                    player_pos + vec3(0, 0, 1.5) + dest * range, hit))
-        {
-            I32 state = glfwGetMouseButton(win, GLFW_MOUSE_BUTTON_LEFT);
-            if(state == GLFW_PRESS && place_delay == 0)
-            {
-                place_delay = 10;
-                Voxel vox = player_voxel;
-                vox.col.r = blur(vox.col.r, 4.f);
-                vox.col.g = blur(vox.col.g, 4.f);
-                vox.col.b = blur(vox.col.b, 4.f);
-                get_vox((ivec3)(hit.vox_pos + hit.norm)) = vox;
-            }
-            state = glfwGetMouseButton(win, GLFW_MOUSE_BUTTON_RIGHT);
-            if(state == GLFW_PRESS && dest_delay == 0)
-            {
-                dest_delay = 3;
-                get_vox((ivec3)hit.vox_pos) = empty_voxel;
-            }
-            else
-            {
-                player_cursor = (ivec3)(hit.vox_pos + hit.norm);
-            }
-        }
-        else player_cursor = {-1, -1, -1};
-        if(place_delay > 0) place_delay--;
-        if(dest_delay > 0) dest_delay--;
-        if(jump_delay > 0) jump_delay--;
+        handle_input();
+        handle_player_physics();
 
         unload_chunks();
         
