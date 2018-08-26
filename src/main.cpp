@@ -8,6 +8,7 @@
 #include <iostream>
 #include <fstream>
 #include <unordered_map>
+#include <vector>
 //
 #define GLM_FORCE_EXPLICIT_CTOR
 #define GLM_ENABLE_EXPERIMENTAL
@@ -21,6 +22,8 @@
 //
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
+//
+#include <CL/cl.h>
 //
 #include "tick_clock.hpp"
 
@@ -40,8 +43,8 @@ typedef float    F32;
 typedef double   F64;
 
 constexpr F32   fps        = 30.f;
-constexpr U32   win_scale  = 10;
-constexpr uvec2 win_size   = {160, 90};
+constexpr U32   win_scale  = 1;
+constexpr uvec2 win_size   = {1600, 900};
 constexpr U32   win_volume = win_size.x * win_size.y;
 
 constexpr F32 TAU = pi<F32>() * 2.f;
@@ -64,8 +67,14 @@ constexpr Voxel grass_voxel  = {{0.3f, 0.8f, 0.2f}, 1.0f};
 constexpr Voxel dirt_voxel   = {{0.6f, 0.3f, 0.1f}, 1.0f};
 constexpr Voxel player_voxel = {{1.0f, 0.0f, 1.0f}, 1.0f};
 
-tvec3<U8>   cast_plane[win_volume];
+tvec4<U8>   cast_plane[win_volume];
 GLFWwindow *win;
+
+cl_context       context;
+cl_program       program;
+cl_kernel        kernel;
+cl_command_queue command_queue;
+cl_mem           cl_screen;
 
 struct Player
 {
@@ -377,10 +386,108 @@ void init_gl()
                            GL_TEXTURE_2D, tex_id, 0);
 }
 
+void check_cl_error(cl_int err)
+{
+    if(err != CL_SUCCESS)
+    {
+        throw std::runtime_error("OpenCL error: " + std::to_string(err));
+    }
+}
+
+void init_cl()
+{
+    const char *program_path = "src/cast_ray.cl";
+
+    cl_uint platform_id_count = 0;
+    cl_int err = CL_SUCCESS;
+    clGetPlatformIDs(0, nullptr, &platform_id_count);
+
+    if(platform_id_count == 0)
+    {
+        throw std::runtime_error("No OpenCL platforms found");
+    }
+
+    std::vector<cl_platform_id> platform_ids(platform_id_count);
+    clGetPlatformIDs(platform_id_count, platform_ids.data(), nullptr);
+
+    cl_uint device_id_count = 0;
+    clGetDeviceIDs(platform_ids[0], CL_DEVICE_TYPE_ALL, 0, nullptr,
+        &device_id_count);
+
+    if(device_id_count == 0)
+    {
+        throw std::runtime_error("No OpenCL devices found");
+    }
+
+    std::vector<cl_device_id> device_ids (device_id_count);
+    clGetDeviceIDs(platform_ids[0], CL_DEVICE_TYPE_GPU, device_id_count,
+        device_ids.data (), nullptr);
+
+    const cl_context_properties context_properties[] =
+    {
+        CL_CONTEXT_PLATFORM,
+        reinterpret_cast<cl_context_properties>(platform_ids[0]),
+        0, 0
+    };
+
+    context = clCreateContext(context_properties, device_id_count,
+        device_ids.data(), nullptr, nullptr, &err);
+    check_cl_error(err);
+    std::ifstream f(program_path);
+    if(!f.good())
+    {
+        throw std::runtime_error("Couldn't load OpenCL program");
+    }
+    f.seekg(0, std::ios::end);
+    std::streampos len = f.tellg();
+    f.seekg(0, std::ios::beg);
+
+    std::vector<char> buff(len);
+    f.read(buff.data(), len);
+    f.close();
+    
+    std::size_t src_len[1]  = { buff.size() };
+    char const *src_data[1] = { buff.data() };
+
+    program =
+        clCreateProgramWithSource(context, 1, src_data, src_len, nullptr);
+
+
+    clBuildProgram(program, device_id_count, device_ids.data(),
+                   nullptr, nullptr, nullptr);
+    {
+        std::size_t log_size;
+        clGetProgramBuildInfo(program, device_ids[0], CL_PROGRAM_BUILD_LOG,
+                              0, nullptr, &log_size);
+        std::vector<char> log(log_size);
+
+        clGetProgramBuildInfo(program, device_ids[0], CL_PROGRAM_BUILD_LOG,
+                              log_size, log.data(), nullptr);
+
+        std::cout << std::string(log.data()) << std::endl;
+    }
+
+    kernel = clCreateKernel(program, "cast_plane", &err);
+    check_cl_error(err);
+
+    static const cl_image_format format = {CL_RGBA, CL_UNORM_INT8};
+
+    cl_screen = clCreateImage2D(context, CL_MEM_WRITE_ONLY, &format,
+        win_size.x, win_size.y, 0, nullptr, &err);
+    check_cl_error(err);
+
+    err = clSetKernelArg(kernel, 6, sizeof(cl_mem), &cl_screen);
+    check_cl_error(err);
+
+    command_queue = clCreateCommandQueue(context, device_ids[0],
+        CL_QUEUE_PROFILING_ENABLE, &err);
+    check_cl_error(err);
+}
+
 void render_screen()
 {
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, win_size.x, win_size.y,
-                 0, GL_RGB, GL_UNSIGNED_BYTE, cast_plane);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, win_size.x, win_size.y,
+                 0, GL_RGBA, GL_UNSIGNED_BYTE, cast_plane);
     glBlitFramebuffer(0, 0, win_size.x            , win_size.y,
                       0, 0, win_size.x * win_scale, win_size.y * win_scale,
                       GL_COLOR_BUFFER_BIT, GL_NEAREST);
@@ -506,7 +613,7 @@ bool cast_ray(vec3 const &from, vec3 const &to, RayHit &hit)
 void cast()
 {
     F32 z_near = 0.01f;
-    F32 z_far  = -512.f;
+    F32 z_far  = -128.f;
     vec3 origin = player.pos + vec3(0, 0, 2);
     mat4 rot(1.f);
     rot = translate(rot, origin);
@@ -521,30 +628,46 @@ void cast()
                         - near_pixel;
     vec3 near_delta_y = plane(z_near, (win_half + vec2(0, 1)) / (vec2)win_size)
                         - near_pixel;
-    vec3 far_pixel = plane(z_far, win_half * 16.f);
-    vec3 far_delta_x = plane(z_far, (win_half + vec2(1, 0)) * 16.f) - far_pixel;
-    vec3 far_delta_y = plane(z_far, (win_half + vec2(0, 1)) * 16.f) - far_pixel;
+    vec3 far_pixel = plane(z_far, win_half * 1.6f);
+    vec3 far_delta_x = plane(z_far, (win_half + vec2(1, 0)) * 1.6f) - far_pixel;
+    vec3 far_delta_y = plane(z_far, (win_half + vec2(0, 1)) * 1.6f) - far_pixel;
 
-    RayHit hit;
-    for(U32 i = 0; i < win_volume; ++i)
-    {
-        vec2 plane_pos = {(i % win_size.x) + 0.5f, (i / win_size.x) + 0.5f};
-        vec3 near = near_pixel +
-                    near_delta_x * (plane_pos.x) +
-                    near_delta_y * (plane_pos.y);
-        vec3 far = far_pixel +
-                   far_delta_x * (plane_pos.x) +
-                   far_delta_y * (plane_pos.y);
-        if(cast_ray(near, far, hit))
-        {
-            if((ivec3)(hit.vox_pos + hit.norm) == player.cursor)
-            {
-                hit.col = {1.f, 1.f, 0.f, 1.f};
-            }
-            cast_plane[i] = vec3(hit.col) * hit.col.a * 255.f;
-        }
-        else cast_plane[i] = empty_voxel.col * 255.f;
-    }
+    cl_uint err;
+    err = clSetKernelArg(kernel, 0, sizeof(cl_float3), &near_pixel);
+    check_cl_error(err);
+    err = clSetKernelArg(kernel, 1, sizeof(cl_float3), &near_delta_x);
+    check_cl_error(err);
+    err = clSetKernelArg(kernel, 2, sizeof(cl_float3), &near_delta_y);
+    check_cl_error(err);
+    err = clSetKernelArg(kernel, 3, sizeof(cl_float3), &far_pixel);
+    check_cl_error(err);
+    err = clSetKernelArg(kernel, 4, sizeof(cl_float3), &far_delta_x);
+    check_cl_error(err);
+    err = clSetKernelArg(kernel, 5, sizeof(cl_float3), &far_delta_y);
+    check_cl_error(err);
+
+    constexpr std::size_t global_work_size [] = {win_size.x, win_size.y, 0};
+    constexpr std::size_t local_work_size  [] = {16, 16, 0};
+    cl_event event;
+    clEnqueueNDRangeKernel(command_queue, kernel, 2,
+        nullptr, global_work_size, local_work_size, 0, nullptr, &event);
+    clWaitForEvents(1, &event);
+    clFinish(command_queue);
+    cl_ulong time_start;
+    cl_ulong time_end;
+
+    clGetEventProfilingInfo(event, CL_PROFILING_COMMAND_START, sizeof(time_start), &time_start, NULL);
+    clGetEventProfilingInfo(event, CL_PROFILING_COMMAND_END, sizeof(time_end), &time_end, NULL);
+
+    double nanoSeconds = time_end-time_start;
+    printf("OpenCl Execution time is: %0.3f milliseconds \n",nanoSeconds / 1000000.0);
+
+    cl_event event2;
+    constexpr std::size_t img_origin[3] = {0, 0, 0};
+    constexpr std::size_t region[3]     = {win_size.x, win_size.y, 1};
+    err = clEnqueueReadImage(command_queue, cl_screen, CL_TRUE,
+        img_origin, region, 0, 0, cast_plane, 0, nullptr, nullptr);
+    check_cl_error(err);
 }
 
 void handle_input()
@@ -619,21 +742,21 @@ void handle_player_physics()
     RayHit hit;
     //player.vel += vec3(0, 0, -0.1f);
 
-    if(!cast_ray(player.pos, player.pos + vec3(player.vel.x, 0, 0), hit))
+    //if(!cast_ray(player.pos, player.pos + vec3(player.vel.x, 0, 0), hit))
     {
         player.pos.x += player.vel.x;
     }
-    else player.vel.x = 0;
-    if(!cast_ray(player.pos, player.pos + vec3(0, player.vel.y, 0), hit))
+    //else player.vel.x = 0;
+    //if(!cast_ray(player.pos, player.pos + vec3(0, player.vel.y, 0), hit))
     {
         player.pos.y += player.vel.y;
     }
-    else player.vel.y = 0;
-    if(!cast_ray(player.pos, player.pos + vec3(0, 0, player.vel.z), hit))
+    //else player.vel.y = 0;
+    //if(!cast_ray(player.pos, player.pos + vec3(0, 0, player.vel.z), hit))
     {
         player.pos.z += player.vel.z;
     }
-    else player.vel.z = 0;
+    //else player.vel.z = 0;
     player.vel *= 0.8f;
 
 }
@@ -642,6 +765,7 @@ int main()
 {
     std::srand(std::time(NULL));
     init_gl();
+    init_cl();
 
     util::TickClock clock(util::TickClock::Duration(1.f) / fps);
 
@@ -663,11 +787,18 @@ int main()
         glfwSwapBuffers(win);
         glfwPollEvents();
         clock.stop();
-        clock.synchronize();
+        auto delta = clock.synchronize();
+        std::cout << delta.count() << std::endl;
     }
 
     save_all();
     glfwTerminate();
+
+    clReleaseMemObject(cl_screen);
+    clReleaseCommandQueue(command_queue);
+    clReleaseKernel(kernel);
+    clReleaseProgram(program);
+    clReleaseContext(context);
     return 0;
 }
 
